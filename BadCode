@@ -1,0 +1,378 @@
+#Instalează pachete dacă nu sunt instalate
+install.packages("igraph")
+install.packages("dplyr")
+install.packages("openxlsx")
+install.packages("threejs")
+install.packages("zoom")
+install.packages("Matrix")
+install.packages("htmlwidgets")
+install.packages("devtools")
+install.packages("visNetwork")
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+BiocManager::install("ReactomePA")
+BiocManager::install("clusterProfiler")
+BiocManager::install("org.Hs.eg.db")
+BiocManager::install("gprofiler2")
+
+
+library(igraph)
+library(dplyr)
+library(openxlsx)
+library(threejs)
+library(htmlwidgets)
+library(zoom)
+library(visNetwork)
+library(ReactomePA)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(gprofiler2)
+library(Matrix) 
+
+load(file.choose())
+A <- get("work_mat2")
+
+attach.entregene_gen <- function (x, map, x_name, map_name, map_target) {
+  print(paste(x_name, map_name, map_target))
+  output <- merge(x, map, by.x=as.character(x_name), by.y=as.character(map_name), all.x=TRUE, sort=FALSE)
+  output <- output[!is.na(output$map_gprofiler.target), ]
+  return(output)
+}
+
+
+
+col_names <- colnames(A)
+map_gprofiler <- gconvert(query = col_names,
+                          organism = "hsapiens",
+                          target = "ENTREZGENE_ACC",
+                          mthreshold = Inf,
+                          filter_na = TRUE)
+colnames(map_gprofiler)
+colnames(map_gprofiler)[colnames(map_gprofiler) == "input"] <- "map_gprofiler.input"
+colnames(map_gprofiler)[colnames(map_gprofiler) == "target"] <- "map_gprofiler.target"
+
+mapped_cols <- attach.entregene_gen(
+  x = data.frame(Original = col_names),
+  map = map_gprofiler,
+  x_name = "Original",
+  map_name = "map_gprofiler.input",
+  map_target = "map_gprofiler.target"
+)
+
+new_col_names <- mapped_cols$map_gprofiler.target
+
+# Matrice noua
+name_dict <- setNames(mapped_cols$map_gprofiler.target, mapped_cols$Original)
+new_col_names <- name_dict[colnames(A)]
+new_col_names[is.na(new_col_names)] <- colnames(A)[is.na(new_col_names)]
+
+# matricea finala
+A_mapped <- A
+colnames(A_mapped) <- new_col_names
+print(new_col_names)
+print(col_names)
+
+genelist <- colnames(A_mapped)
+genelist <- genelist[!duplicated(genelist)]
+
+# 
+# gostres2 <- gost(query = genelist, organism = "hsapiens", ordered_query = FALSE, 
+#                  multi_query = FALSE,
+#                  significant = TRUE,  
+#                  exclude_iea = FALSE,
+#                  measure_underrepresentation = FALSE,
+#                  evcodes = TRUE,
+#                  user_threshold = 0.05,
+#                  correction_method = "fdr",
+#                  domain_scope = "annotated", 
+#                  custom_bg = NULL,
+#                  numeric_ns = "",
+#                  sources = NULL,
+#                  as_short_link = FALSE)
+
+#grupare in cate 200 batch-uri pentru rapiditate, similar cu codul de sus
+
+batch_size <- 200
+gene_batches <- split(genelist, ceiling(seq_along(genelist) / batch_size))
+library(gprofiler2)
+
+results_list <- list()
+
+for (i in seq_along(gene_batches)) {
+  cat("Procesare batch", i, "din", length(gene_batches), "\n")
+  
+  batch <- gene_batches[[i]]
+  
+  res <- gost(query = batch,
+              organism = "hsapiens",
+              ordered_query = FALSE,
+              significant = TRUE,       
+              exclude_iea = FALSE,
+              evcodes = TRUE,
+              user_threshold = 0.05,
+              correction_method = "fdr",
+              domain_scope = "annotated",
+              sources = c("GO:BP", "KEGG"))  
+  
+  results_list[[i]] <- res$result
+}
+
+all_results <- do.call(rbind, results_list)
+
+xScale_safe <- function(x) {
+  if(length(x) == 0) return(NA_real_)
+  xScale(x)
+}
+
+
+all_results <- all_results[!duplicated(all_results$term_id), ]
+all_results <- all_results %>%
+  filter(!is.na(term_name), !is.na(p_value))
+
+
+valid_sources <- unique(all_results$source)
+cat("Surse valide găsite:", valid_sources, "\n")
+
+all_results <- all_results %>% filter(source %in% valid_sources)
+
+
+valid_sources <- all_results %>%
+  group_by(source) %>%
+  filter(n() > 0) %>%
+  summarise(count = n()) %>%
+  filter(count > 0) %>%
+  pull(source)
+
+all_results <- all_results %>% filter(source %in% valid_sources)
+
+
+cat("Surse valide pentru plot:", valid_sources, "\n")
+
+all_results <- all_results %>% filter(source %in% valid_sources)
+
+
+
+library(dplyr)
+
+library(dplyr)
+
+
+all_results <- all_results %>%
+  filter(!is.na(term_name), !is.na(p_value)) %>%         
+  group_by(source) %>%
+  filter(n() > 0) %>%
+  mutate(order = rank(-log10(p_value), ties.method = "first")) %>%  
+  ungroup()
+
+# Reconstruire obiect gostresult curat
+gostres2 <- list(
+  result = all_results,
+  meta   = list(
+    query = genelist,
+    organism = "hsapiens",
+    sources = unique(all_results$source)
+  )
+)
+class(gostres2) <- "gostresult"
+
+
+if (nrow(all_results) == 0) {
+  message("Nu există rezultate valide pentru plotare.")
+} else {
+  message("Surse finale curate: ", paste(unique(all_results$source), collapse = ", "))
+  
+  # Apel sigur
+  p <- tryCatch({
+    gostplot(gostres2, capped = FALSE, interactive = FALSE)
+  }, error = function(e) {
+    message("Eroare în gostplot(): ", e$message)
+    return(NULL)
+  })
+  
+  if (!is.null(p)) print(p) else message("Plotul nu a fost generat.")
+}
+
+
+################################################################
+
+
+# Verificare suplimentara
+source_counts <- all_results %>% 
+  group_by(source) %>% 
+  summarise(count = n()) %>% 
+  filter(count > 0)
+
+if (nrow(source_counts) == 0) {
+  message("Nu exista surse valide pentru a genera graficul gostplot().")
+} else {
+  
+  valid_sources <- source_counts$source
+  all_results <- all_results %>% filter(source %in% valid_sources)
+  
+  gostres2 <- list(
+    result = all_results,
+    meta   = list(
+      query = genelist,
+      organism = "hsapiens",
+      sources = unique(all_results$source)
+    )
+  )
+  class(gostres2) <- "gostresult"
+  
+  message("Surse finale pentru plotare: ", paste(valid_sources, collapse = ", "))
+  
+  safe_gostplot <- function(gostres2) {
+    tryCatch({
+      gostplot(gostres2, capped = FALSE, interactive = FALSE)
+    }, error = function(e) {
+      message(" Eroare în gostplot: ", e$message)
+      return(NULL)
+    })
+  }
+  
+  p <- safe_gostplot(gostres2)
+  if (!is.null(p)) {
+    print(p)
+  } else {
+    message("rezultatul este gol")
+  }
+ }
+
+##########################
+
+if (exists("all_results") && is.data.frame(all_results) && nrow(all_results) > 0) {
+  p <- gostplot(gostres2, capped = FALSE, interactive = FALSE)
+  print(p)
+} else {
+  message("Nu exista rezultate semnificative")
+}
+
+
+
+
+
+head(gostres2$result)  
+View(gostres2$result) 
+
+func_list <- dplyr::select(gostres2$result, term_name, intersection)
+
+# Dict protein -> functionalitati
+protein_funcs <- list()
+for (i in 1:nrow(func_list)) {
+  genes <- unlist(func_list$intersection[i])
+  for (g in genes) {
+    if (!g %in% names(protein_funcs)) protein_funcs[[g]] <- c()
+    protein_funcs[[g]] <- unique(c(protein_funcs[[g]], func_list$term_name[i]))
+  }
+}
+
+proteins <- names(protein_funcs)
+n <- length(proteins)
+
+
+sim_matrix <- matrix(0, nrow = n, ncol = n)
+rownames(sim_matrix) <- proteins
+colnames(sim_matrix) <- proteins
+
+
+for (i in 1:n) {
+  for (j in i:n) {
+    common_funcs <- length(intersect(protein_funcs[[proteins[i]]], protein_funcs[[proteins[j]]]))
+    sim_matrix[i,j] <- common_funcs
+    sim_matrix[j,i] <- common_funcs
+  }
+}
+
+sim_matrix[1:5, 1:5]
+
+
+g <- graph_from_adjacency_matrix(sim_matrix, mode = "undirected", weighted = TRUE, diag = FALSE)
+plot(g, vertex.label = V(g)$name, edge.width = E(g)$weight/5)
+
+
+methods <- list()
+node_features <- data.frame(
+  degree = degree(g),
+  closeness = closeness(g),
+  betweenness = betweenness(g)
+)
+
+scaled_features <- scale(node_features)
+kmeans_result <- kmeans(scaled_features, centers = 4, nstart = 25)
+methods$kmeans <- as.numeric(kmeans_result$cluster)
+
+methods$leading_eigen <- as.numeric(membership(cluster_leading_eigen(g)))
+g <- simplify(g, remove.multiple = TRUE, remove.loops = TRUE)
+methods$fast_greedy <- as.numeric(membership(cluster_fast_greedy(g)))
+methods$louvain <- as.numeric(membership(cluster_louvain(g)))
+methods$walktrap <- as.numeric(membership(cluster_walktrap(g)))
+methods$label_propagation <- as.numeric(membership(cluster_label_prop(g)))
+methods$infomap <- as.numeric(membership(cluster_infomap(g)))
+
+if (!is.null(colnames(A_mapped))) {
+  V(g)$name <- colnames(A_mapped)
+} else {
+  V(g)$name <- as.character(1:length(V(g)))
+}
+
+
+node_intersections <- data.frame(
+  node = V(g)$name,
+  kmeans = methods$kmeans,
+  leading_eigen = methods$leading_eigen,
+  fast_greedy = methods$fast_greedy,
+  louvain = methods$louvain,
+  walktrap = methods$walktrap,
+  label_propagation = methods$label_propagation,
+  infomap = methods$infomap
+)
+
+node_intersections <- node_intersections %>%
+  rowwise() %>%
+  mutate(
+    intersection_count = n_distinct(c_across(-node)),
+    most_frequent = names(sort(table(c_across(-node)), decreasing = TRUE)[1])
+  ) %>%
+  ungroup()
+
+write.xlsx(node_intersections, "node_intersections2.xlsx")
+
+color_scale <- colorRampPalette(c("yellow", "orange", "red"))
+node_colors <- color_scale(max(node_intersections$intersection_count))[
+  node_intersections$intersection_count
+]
+V(g)$color <- node_colors
+
+# Vizualizare grafic
+gjs <- graphjs(g, main = "Network!", bg = "gray", showLabels = F, stroke = F, 
+               curvature = 0.1, attraction = 0.9, repulsion = 0.8, opacity = 0.9)
+
+print(gjs)
+saveWidget(gjs, file = "Media-Network-gjs.html")
+browseURL("Media-Network-gjs.html")
+
+gjs.an <- graphjs(g, bg = "white", showLabels = F, stroke = F, 
+                  layout = list(layout_randomly(g, dim = 3),
+                                layout_with_fr(g, dim = 3),
+                                layout_with_drl(g, dim = 3),
+                                layout_on_sphere(g)),
+                  clickCallback = htmlwidgets::JS(
+                    "function(node) {
+      if (node !== null) {
+        let nodeName = this.graph.nodes[node].name || 'Unknown Node';
+        console.log('Node clicked:', nodeName);
+        alert('You clicked on node: ' + nodeName);
+      } else {
+        console.log('No node clicked.');
+      }
+    }"
+                  ),
+                  vertex.color = list(V(g)$color, "gray", "orange", V(g)$color),
+                  main = list("Random Layout",
+                              "Fruchterman-Reingold", "DrL layout", "Sphere"))
+print(gjs.an)
+saveWidget(gjs.an, file = "Media-Network-gjs-an.html")
+browseURL("Media-Network-gjs-an.html")
+
+
+openXL("node_intersections2.xlsx")
