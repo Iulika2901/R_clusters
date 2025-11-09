@@ -1,0 +1,106 @@
+# install.packages("stringi", repos = "https://cloud.r-project.org/")
+# install.packages("visNetwork", repos = "https://cloud.r-project.org/")
+# install.packages("dplyr", repos = "https://cloud.r-project.org/")
+# install.packages("magrittr", repos = "https://cloud.r-project.org/")
+# install.packages("igraph", repos = "https://cloud.r-project.org/")
+# install.packages("robust", repos = "https://cloud.r-project.org/")
+# install.packages("threejs", repos = "https://cloud.r-project.org/")
+# install.packages("openxlsx", repos = "https://cloud.r-project.org/")
+# install.packages("aricode", repos = "https://cloud.r-project.org/")
+# install.packages("fit.models", repos = "https://cloud.r-project.org/")
+# install.packages("zoom", repos = "https://cloud.r-project.org/")
+#
+# library(igraph)
+# library(dplyr)
+# library(magrittr)
+# library(openxlsx)
+# library(threejs)
+# library(htmlwidgets)
+# library(zoom)
+# library(visNetwork)
+# library(robust)
+# library(fit.models)
+# library(aricode)
+ 
+ 
+work_mat3 <- get("work_mat3")
+g <- graph_from_adjacency_matrix(work_mat3, mode = "undirected", weighted = TRUE)
+ 
+#graf nou
+set.seed(123)
+all_nodes <- V(g)$name
+num_to_remove <- round(0.10 * length(all_nodes))
+nodes_to_remove <- sample(all_nodes, num_to_remove)
+g_modificat <- delete_vertices(g, nodes_to_remove)
+ 
+set.seed(123)
+all_nodes <- V(g)$name
+num_to_remove <- round(0.20 * length(all_nodes))
+nodes_to_remove <- sample(all_nodes, num_to_remove)
+g_modificat2 <- delete_vertices(g, nodes_to_remove)
+ 
+ 
+#clustere
+ 
+cluster_kmeans <- function(graph, k = 5) {
+  node_features <- data.frame(
+    degree = degree(graph),
+    closeness = closeness(graph),
+    betweenness = betweenness(graph)
+  )
+  scaled_features <- scale(node_features)
+  scaled_features[is.na(scaled_features)] <- 0
+  scaled_features[is.nan(scaled_features)] <- 0
+  clust <- kmeans(scaled_features, centers = k, nstart = 25)$cluster
+  names(clust) <- V(graph)$name
+  return(clust)
+}
+ 
+get_clustering_methods <- function(graph) {
+  list(
+    kmeans = cluster_kmeans(graph),
+    spectral = cluster_leading_eigen(graph)$membership,
+    leading_eigen = cluster_leading_eigen(graph)$membership,
+    fast_greedy = cluster_fast_greedy(graph) %>% membership(),
+    louvain = cluster_louvain(graph) %>% membership(),
+    walktrap = cluster_walktrap(graph) %>% membership(),
+    label_propagation = cluster_label_prop(graph) %>% membership(),
+    infomap = cluster_infomap(graph) %>% membership()
+  )
+}
+ 
+ 
+methods_g <- get_clustering_methods(g)
+methods_g_mod <- get_clustering_methods(g_modificat)
+methods_g_mod <- get_clustering_methods(g_modificat2)
+ 
+ 
+#comparare nod comun
+ 
+results <- data.frame()
+ 
+for (method in names(methods_g)) {
+  vec1 <- methods_g[[method]]
+  vec2 <- methods_g_mod[[method]]
+  common_nodes <- intersect(names(vec1), names(vec2))
+  if (length(common_nodes) > 0) {
+    part1 <- vec1[common_nodes]
+    part2 <- vec2[common_nodes]
+    ari_val <- ARI(part1, part2)
+    nmi_val <- NMI(part1, part2)
+    robustete_val <- (ari_val + nmi_val) / 2
+    results <- rbind(results, data.frame(
+      Method = method,
+      ARI = ari_val,
+      NMI = nmi_val,
+      Robustete = robustete_val
+    ))
+  }
+}
+ 
+# excel
+ 
+write.xlsx(results, "comparatie_robustete.xlsx")
+cat("Rezultatele au fost salvate in comparatie_robustete.xlsx\n")
+openXL("comparatie_robustete.xlsx")
+ 
