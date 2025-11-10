@@ -9,7 +9,7 @@ library(future)
 
 plan(multisession) # Asincron
 
-# Funcție de log
+
 append_log <- function(msg, log_reactive) {
   isolate({
     log <- log_reactive()
@@ -21,14 +21,14 @@ ui <- page_sidebar(
   title = "Graph Clustering Demo",
   
   sidebar = sidebar(
-    fileInput("file", "Alege fișierul cu matricea de adiacență:", 
+    fileInput("file", "Choose file:", 
               accept = c(".csv", ".R", ".RData", ".rds")),
     
     selectInput("select", "Select options:", 
                 list("Apply a cluster method on a graph" = "cluster", 
                      "Correlation Matrix" = "correlation")),
     
-    # Cluster options
+    
     conditionalPanel(
       condition = "input.select == 'cluster'",
       numericInput("k", "Număr de clustere (pentru k-means):", min = 1, max = 10, value = 3),
@@ -42,8 +42,7 @@ ui <- page_sidebar(
       h4("Log metode:"),
       verbatimTextOutput("log")
     ),
-    
-    # Correlation options
+   
     conditionalPanel(
       condition = "input.select == 'correlation'",
       checkboxGroupInput("checkbox_group", "Select clustering methods:", 
@@ -118,7 +117,7 @@ server <- function(input, output, session) {
     paste(log_msgs(), collapse = "\n")
   })
   
-  # Observers pentru toate metodele, asincron
+  # Observere pentru toate metodele, in mod asincron
   lapply(names(methods), function(btn) {
     observeEvent(input[[btn]], {
       req(data_reactive())
@@ -158,7 +157,7 @@ server <- function(input, output, session) {
     data.frame(Node = rownames(res$graph[]), Cluster = res$cluster)
   })
   
-  # ARI calculation
+  # correlation matrix
   observeEvent(input$show_results, {
     req(input$checkbox_group)
     clusters_selected <- list()
@@ -175,11 +174,11 @@ server <- function(input, output, session) {
     }
     
     if (length(clusters_selected) < 2) {
-      showNotification(paste("Rulează mai întâi cel puțin două metode:", paste(not_run, collapse=", ")), type="warning")
+      showNotification(paste("First run your methods in the section 'Apply a cluster method...'", paste(not_run, collapse=", ")), type="warning")
       return()
     }
     
-    show_modal_spinner("circle", "Calculăm ARI...")
+    show_modal_spinner("circle", "Calculate ARI...")
     
     future({
       method_names <- names(clusters_selected)
@@ -206,10 +205,10 @@ server <- function(input, output, session) {
       output$corrTable <- renderTable(round(corr_mat,3), rownames=TRUE)
       
       remove_modal_spinner()
-      showNotification("Matricea ARI calculată cu succes!", type="message")
+      showNotification("ARI matrix run succesfully!", type="message")
     }) %...!% (function(e){
       remove_modal_spinner()
-      showNotification(paste("Eroare calcul ARI:", e$message), type="error")
+      showNotification(paste("Error at ARI:", e$message), type="error")
     })
   })
 }
