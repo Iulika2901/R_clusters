@@ -6,8 +6,11 @@ library(ggplot2)
 library(shinybusy)
 library(promises)
 library(future)
+library(threejs)
+library(RColorBrewer)
+library(htmltools)
 
-plan(multisession) # Asincron
+plan(multisession) 
 
 
 append_log <- function(msg, log_reactive) {
@@ -17,21 +20,22 @@ append_log <- function(msg, log_reactive) {
   })
 }
 
+
 ui <- page_sidebar(
   title = "Graph Clustering Demo",
   
   sidebar = sidebar(
-    fileInput("file", "Choose file:", 
+    fileInput("file", "Alege fișierul cu matricea de adiacență:", 
               accept = c(".csv", ".R", ".RData", ".rds")),
     
-    selectInput("select", "Select options:", 
+    selectInput("select", "Selectează opțiunea:", 
                 list("Apply a cluster method on a graph" = "cluster", 
                      "Correlation Matrix" = "correlation")),
     
-    
     conditionalPanel(
       condition = "input.select == 'cluster'",
-      numericInput("k", "Număr de clustere (pentru k-means):", min = 1, max = 10, value = 3),
+      numericInput("k", "Număr de clustere (pentru k-means):", 
+                   min = 1, max = 10, value = 3),
       actionButton("btn_kmeans", "K-Means"),
       actionButton("btn_fastgreedy", "Fast Greedy"),
       actionButton("btn_louvain", "Louvain"),
@@ -42,8 +46,8 @@ ui <- page_sidebar(
       h4("Log metode:"),
       verbatimTextOutput("log")
     ),
-   
-    conditionalPanel(
+    
+     conditionalPanel(
       condition = "input.select == 'correlation'",
       checkboxGroupInput("checkbox_group", "Select clustering methods:", 
                          c("K-Means" = "km", "Fast Greedy" = "fg", 
@@ -55,11 +59,19 @@ ui <- page_sidebar(
   
   mainPanel(
     conditionalPanel(condition = "input.select == 'cluster'",
-                     plotOutput("graphPlot"), tableOutput("clusteredTable")),
+                     tabsetPanel(
+                       tabPanel("2D Graph", plotOutput("graphPlot")),
+                       tabPanel("3D Graph", uiOutput("graphPlot3D")),
+                       tabPanel("Cluster Table", tableOutput("clusteredTable"))
+                     )
+    ),
     conditionalPanel(condition = "input.select == 'correlation'",
-                     plotOutput("corrPlot"), tableOutput("corrTable"))
+                     plotOutput("corrPlot"),
+                     tableOutput("corrTable")
+    )
   )
 )
+
 
 server <- function(input, output, session) {
   
@@ -85,6 +97,7 @@ server <- function(input, output, session) {
     }
   })
   
+  
   run_clustering <- function(g, method, k = 3) {
     if (method == "kmeans") {
       layout <- layout_with_fr(g)
@@ -103,6 +116,7 @@ server <- function(input, output, session) {
     }
   }
   
+  
   clustering_res <- reactiveVal(NULL)
   all_results <- reactiveValues()
   log_msgs <- reactiveVal(character())
@@ -117,31 +131,36 @@ server <- function(input, output, session) {
     paste(log_msgs(), collapse = "\n")
   })
   
-  # Observere pentru toate metodele, in mod asincron
+  
   lapply(names(methods), function(btn) {
     observeEvent(input[[btn]], {
       req(data_reactive())
+      
       adj <- as.matrix(data_reactive())
       g <- graph_from_adjacency_matrix(adj, mode = "undirected", weighted = TRUE)
+      method_name <- methods[[btn]]
+      k_val <- isolate(input$k)  
       
-      append_log(paste("Start", methods[[btn]]), log_msgs)
+      append_log(paste("Start", method_name), log_msgs)
       
-      future({
-        run_clustering(g, methods[[btn]], input$k)
+       future({
+        run_clustering(g, method_name, k_val)
       }) %...>% (function(res) {
         res$graph <- g
         clustering_res(res)
-        all_results[[methods[[btn]]]] <- res$cluster
-        append_log(paste("Finalizat", methods[[btn]]), log_msgs)
-      }) %...!% (function(e){
-        append_log(paste("Eroare", methods[[btn]], ":", e$message), log_msgs)
+        all_results[[method_name]] <- res$cluster
+        append_log(paste("Finalizat", method_name), log_msgs)
+      }) %...!% (function(e) {
+        append_log(paste("Eroare", method_name, ":", e$message), log_msgs)
       })
     })
   })
   
+  
+  # --- Plot 2D ---
   plot_graph <- function(g, layout, cluster, centers = NULL, k = 3) {
     plot(g, layout = layout, vertex.color = cluster, vertex.size = 15,
-         vertex.label = NA, main = "Graph Clustering")
+         vertex.label = NA, main = "Graph Clustering (2D)")
     if (!is.null(centers)) points(centers, col = 1:k, pch = 8, cex = 2, lwd = 2)
   }
   
@@ -151,13 +170,41 @@ server <- function(input, output, session) {
     plot_graph(res$graph, res$layout, res$cluster, res$centers, input$k)
   })
   
+  
+  # --- Plot 3D (interactiv) ---
+  output$graphPlot3D <- renderUI({
+    res <- clustering_res()
+    req(!is.null(res))
+    
+    g <- res$graph
+    cluster <- as.factor(res$cluster)
+    
+    layout3d <- layout_with_fr(g, dim = 3)
+    colors <- RColorBrewer::brewer.pal(max(3, length(unique(cluster))), "Set2")[as.numeric(cluster)]
+    
+    g3d <- threejs::graphjs(
+      g,
+      layout = layout3d,
+      vertex.color = colors,
+      vertex.size = 0.8,
+      vertex.label = NA,
+      main = "3D Interactive Graph",
+      bg = "gray"
+    )
+    
+    htmltools::tagList(g3d)
+  })
+  
+  
+  # --- Cluster Table ---
   output$clusteredTable <- renderTable({
     res <- clustering_res()
     req(!is.null(res))
-    data.frame(Node = rownames(res$graph[]), Cluster = res$cluster)
+    data.frame(Node = 1:vcount(res$graph), Cluster = res$cluster)
   })
   
-  # correlation matrix
+  
+  # --- Correlation (ARI Matrix) ---
   observeEvent(input$show_results, {
     req(input$checkbox_group)
     clusters_selected <- list()
@@ -174,11 +221,12 @@ server <- function(input, output, session) {
     }
     
     if (length(clusters_selected) < 2) {
-      showNotification(paste("First run your methods in the section 'Apply a cluster method...'", paste(not_run, collapse=", ")), type="warning")
+      showNotification(paste("Rulează mai întâi cel puțin două metode:", 
+                             paste(not_run, collapse=", ")), type="warning")
       return()
     }
     
-    show_modal_spinner("circle", "Calculate ARI...")
+    show_modal_spinner("circle", "Calculăm ARI...")
     
     future({
       method_names <- names(clusters_selected)
@@ -205,12 +253,15 @@ server <- function(input, output, session) {
       output$corrTable <- renderTable(round(corr_mat,3), rownames=TRUE)
       
       remove_modal_spinner()
-      showNotification("ARI matrix run succesfully!", type="message")
+      showNotification("Matricea ARI calculată cu succes!", type="message")
     }) %...!% (function(e){
       remove_modal_spinner()
-      showNotification(paste("Error at ARI:", e$message), type="error")
+      showNotification(paste("Eroare calcul ARI:", e$message), type="error")
     })
   })
 }
 
+# ---------------------- #
+# 🚀 Rulează aplicația   #
+# ---------------------- #
 shinyApp(ui, server)
