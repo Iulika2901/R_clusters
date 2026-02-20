@@ -51,9 +51,7 @@
     <li><strong>Analyze & Export:</strong> Switch between 2D, 3D, and Table views. Use the <em>Download</em> button to save your results.</li>
 </ol>
 
-<div class="footer">
-    <p>Developed for Bioinformatics Research | &copy; 2024 Graph Bio-Clustering Team</p>
-</div>
+
 
 </body>
 </html>
