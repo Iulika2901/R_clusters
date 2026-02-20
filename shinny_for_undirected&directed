@@ -1,0 +1,209 @@
+library(shiny)
+library(bslib)
+library(igraph)
+library(mclust)
+library(ggplot2)
+library(shinybusy)
+library(promises)
+library(future)
+library(threejs)
+library(RColorBrewer)
+library(htmltools)
+library(gprofiler2)
+library(dplyr)
+
+plan(multisession)
+
+# Functia de mapping bio
+attach.entregene_gen <- function (x, map, x_name, map_name, map_target) {
+  output <- merge(x, map, by.x=as.character(x_name), by.y=as.character(map_name), all.x=TRUE, sort=FALSE)
+  output <- output[!is.na(output$map_gprofiler.target), ]
+  return(output)
+}
+
+ui <- page_sidebar(
+  title = "Graph Bioinformatics & Clustering",
+  sidebar = sidebar(
+    radioButtons("graph_type", "Select Workflow:",
+                 choices = c("Simple Undirected" = "undirected", 
+                             "Biological Directed" = "directed"),
+                 selected = "undirected"),
+    hr(),
+    fileInput("file", "Choose Matrix File:", accept = c(".csv", ".RData", ".rds")),
+    
+    selectInput("select", "Option:", list("Clustering" = "cluster", "ARI Correlation" = "correlation")),
+    
+    conditionalPanel(
+      condition = "input.select == 'cluster'",
+      numericInput("k", "K-Means Clusters:", min = 1, max = 10, value = 3),
+      actionButton("btn_kmeans", "K-Means"),
+      conditionalPanel(
+        condition = "input.graph_type == 'undirected'",
+        actionButton("btn_fastgreedy", "Fast Greedy"),
+        actionButton("btn_louvain", "Louvain")
+      ),
+      actionButton("btn_walktrap", "Walktrap"),
+      actionButton("btn_label", "Label Propagation"),
+      actionButton("btn_infomap", "Infomap"),
+      hr(),
+      downloadButton("download_table", "Download Cluster Table"),
+      hr(),
+      verbatimTextOutput("log")
+    )
+  ),
+  
+  mainPanel(
+    tabsetPanel(
+      tabPanel("2D Graph", plotOutput("graphPlot")),
+      tabPanel("3D Graph", uiOutput("graphPlot3D")),
+      tabPanel("Table", tableOutput("clusteredTable"))
+    )
+  )
+)
+
+server <- function(input, output, session) {
+  
+  log_msgs <- reactiveVal(character())
+  clustering_res <- reactiveVal(NULL)
+  all_results <- reactiveValues()
+  
+  data_raw <- reactive({
+    infile <- input$file
+    req(infile)
+    ext <- tools::file_ext(infile$name)
+    if (ext == "csv") return(read.csv(infile$datapath, row.names = 1))
+    if (ext == "rds") return(readRDS(infile$datapath))
+    if (ext == "RData") {
+      tmp_env <- new.env()
+      load(infile$datapath, envir = tmp_env)
+      if(exists("work_mat2", envir = tmp_env)) return(get("work_mat2", envir = tmp_env))
+      objs <- mget(ls(tmp_env), envir = tmp_env)
+      for (o in objs) if (is.data.frame(o) || is.matrix(o)) return(as.data.frame(o))
+    }
+    stop("File format not supported")
+  })
+  
+  process_biological_graph <- function(A) {
+    col_names <- colnames(A)
+    map_gprofiler <- gconvert(query = col_names, organism = "hsapiens", target = "ENTREZGENE_ACC", filter_na = TRUE)
+    colnames(map_gprofiler)[colnames(map_gprofiler) == "input"] <- "map_gprofiler.input"
+    colnames(map_gprofiler)[colnames(map_gprofiler) == "target"] <- "map_gprofiler.target"
+    
+    mapped_cols <- attach.entregene_gen(data.frame(Original = col_names), map_gprofiler, "Original", "map_gprofiler.input", "map_gprofiler.target")
+    genelist <- unique(mapped_cols$map_gprofiler.target)
+    gostres <- gost(query = genelist, organism = "hsapiens")
+    
+    req(gostres$result)
+    func_list <- gostres$result[, c("term_name", "intersection")]
+    protein_funcs <- list()
+    for (i in 1:nrow(func_list)) {
+      genes <- unlist(strsplit(func_list$intersection[i], ","))
+      for (g in genes) { protein_funcs[[g]] <- unique(c(protein_funcs[[g]], func_list$term_name[i])) }
+    }
+    
+    prots <- names(protein_funcs)
+    n <- length(prots)
+    sim_mat <- matrix(0, n, n, dimnames = list(prots, prots))
+    for (i in 1:n) {
+      for (j in i:n) {
+        common <- length(intersect(protein_funcs[[prots[i]]], protein_funcs[[prots[j]]]))
+        sim_mat[i,j] <- sim_mat[j,i] <- common
+      }
+    }
+    return(sim_mat)
+  }
+  
+  methods_map <- list(btn_kmeans="kmeans", btn_fastgreedy="fastgreedy", btn_louvain="louvain", 
+                      btn_walktrap="walktrap", btn_label="label", btn_infomap="infomap")
+  
+  observe({
+    lapply(names(methods_map), function(btn_id) {
+      observeEvent(input[[btn_id]], {
+        req(data_raw())
+        show_modal_spinner(text = "Calculating (Parallel)...")
+        
+        type <- input$graph_type
+        method_name <- methods_map[[btn_id]]
+        k_val <- input$k
+        df <- data_raw()
+        
+        # FIX: seed = TRUE rezolvă eroarea de numere aleatorii în viitor
+        future({
+          if (type == "directed") {
+            final_mat <- process_biological_graph(df)
+            g <- graph_from_adjacency_matrix(as.matrix(final_mat), mode = "directed", weighted = TRUE)
+          } else {
+            g <- graph_from_adjacency_matrix(as.matrix(df), mode = "undirected", weighted = TRUE)
+          }
+          
+          layout <- layout_with_fr(g)
+          if (method_name == "kmeans") {
+            cl <- kmeans(layout, centers = k_val)$cluster
+          } else {
+            comm <- switch(method_name,
+                           fastgreedy = cluster_fast_greedy(g),
+                           louvain = cluster_louvain(g),
+                           walktrap = cluster_walktrap(g),
+                           label = cluster_label_prop(g),
+                           infomap = cluster_infomap(g))
+            cl <- as.numeric(membership(comm))
+          }
+          list(g = g, layout = layout, cluster = cl, method = method_name, node_names = V(g)$name)
+        }, seed = TRUE) %...>% (function(res) {
+          remove_modal_spinner()
+          clustering_res(res)
+          all_results[[res$method]] <- res$cluster
+          log_msgs(c(log_msgs(), paste(Sys.time(), "-", res$method, "done")))
+        }) %...!% (function(e) {
+          remove_modal_spinner()
+          showNotification(paste("Error:", e$message), type = "error")
+        })
+      })
+    })
+  })
+  
+  # --- Randare Tabel ---
+  output$clusteredTable <- renderTable({
+    res <- clustering_res()
+    req(res)
+    data.frame(
+      Node_Name = res$node_names,
+      Cluster = res$cluster
+    )
+  })
+  
+  # --- Logica Download ---
+  output$download_table <- downloadHandler(
+    filename = function() {
+      paste("clustering_results_", Sys.Date(), ".csv", sep = "")
+    },
+    content = function(file) {
+      res <- clustering_res()
+      req(res)
+      df <- data.frame(Node_Name = res$node_names, Cluster = res$cluster)
+      write.csv(df, file, row.names = FALSE)
+    }
+  )
+  
+  output$graphPlot <- renderPlot({
+    res <- clustering_res()
+    req(res)
+    plot(res$g, layout = res$layout, vertex.color = res$cluster, 
+         vertex.label = V(res$g)$name, vertex.size = 15,
+         edge.arrow.size = if(is_directed(res$g)) 0.4 else 0,
+         main = paste("Method:", res$method))
+  })
+  
+  output$graphPlot3D <- renderUI({
+    res <- clustering_res()
+    req(res)
+    g3d <- graphjs(res$g, layout = layout_with_fr(res$g, dim=3), 
+                   vertex.color = brewer.pal(8, "Set2")[as.numeric(res$cluster) %% 8 + 1],
+                   vertex.size = 0.5)
+    htmltools::tagList(g3d)
+  })
+  
+  output$log <- renderText({ paste(log_msgs(), collapse = "\n") })
+}
+
+shinyApp(ui, server)
