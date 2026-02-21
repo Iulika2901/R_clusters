@@ -14,7 +14,6 @@ library(dplyr)
 
 plan(multisession)
 
-# Functia de mapping bio
 attach.entregene_gen <- function (x, map, x_name, map_name, map_target) {
   output <- merge(x, map, by.x=as.character(x_name), by.y=as.character(map_name), all.x=TRUE, sort=FALSE)
   output <- output[!is.na(output$map_gprofiler.target), ]
@@ -127,7 +126,6 @@ server <- function(input, output, session) {
         k_val <- input$k
         df <- data_raw()
         
-        # FIX: seed = TRUE rezolvă eroarea de numere aleatorii în viitor
         future({
           if (type == "directed") {
             final_mat <- process_biological_graph(df)
@@ -162,7 +160,6 @@ server <- function(input, output, session) {
     })
   })
   
-  # --- Randare Tabel ---
   output$clusteredTable <- renderTable({
     res <- clustering_res()
     req(res)
@@ -172,8 +169,7 @@ server <- function(input, output, session) {
     )
   })
   
-  # --- Logica Download ---
-  output$download_table <- downloadHandler(
+   output$download_table <- downloadHandler(
     filename = function() {
       paste("clustering_results_", Sys.Date(), ".csv", sep = "")
     },
