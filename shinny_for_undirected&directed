@@ -11,6 +11,7 @@ library(RColorBrewer)
 library(htmltools)
 library(gprofiler2)
 library(dplyr)
+library(corrplot)
 
 plan(multisession)
 
@@ -21,41 +22,47 @@ attach.entregene_gen <- function (x, map, x_name, map_name, map_target) {
 }
 
 ui <- page_sidebar(
-  title = "Graph Bioinformatics & Clustering",
+  title = "Graph Bioinformatics & Clustering Expert",
   sidebar = sidebar(
-    radioButtons("graph_type", "Select Workflow:",
+    h5("1. Data Loading"),
+    fileInput("file", "Choose file (csv, rds, RData):", accept = c(".csv", ".RData", ".rds")),
+    radioButtons("graph_type", "Workflow Type:",
                  choices = c("Simple Undirected" = "undirected", 
                              "Biological Directed" = "directed"),
                  selected = "undirected"),
     hr(),
-    fileInput("file", "Choose Matrix File:", accept = c(".csv", ".RData", ".rds")),
-    
-    selectInput("select", "Option:", list("Clustering" = "cluster", "ARI Correlation" = "correlation")),
-    
-    conditionalPanel(
-      condition = "input.select == 'cluster'",
-      numericInput("k", "K-Means Clusters:", min = 1, max = 10, value = 3),
-      actionButton("btn_kmeans", "K-Means"),
-      conditionalPanel(
-        condition = "input.graph_type == 'undirected'",
-        actionButton("btn_fastgreedy", "Fast Greedy"),
-        actionButton("btn_louvain", "Louvain")
-      ),
-      actionButton("btn_walktrap", "Walktrap"),
-      actionButton("btn_label", "Label Propagation"),
-      actionButton("btn_infomap", "Infomap"),
-      hr(),
-      downloadButton("download_table", "Download Cluster Table"),
-      hr(),
-      verbatimTextOutput("log")
-    )
+    h5("2. Quality Control & Robustness"),
+    sliderInput("noise_level", "Noise Level (Jitter):", min = 0, max = 1, value = 0, step = 0.05),
+    checkboxInput("filter_isolated", "Remove isolated clusters (<3 nodes)", value = FALSE),
+    hr(),
+    h5("3. Clustering Algorithms"),
+    numericInput("k", "K-Means (nr. clusters):", min = 1, max = 10, value = 3),
+    div(style="display: flex; flex-direction: column; gap: 5px;",
+        actionButton("btn_kmeans", "Run K-Means", class = "btn-primary"),
+        actionButton("btn_louvain", "Run Louvain"),
+        actionButton("btn_walktrap", "Run Walktrap"),
+        actionButton("btn_fastgreedy", "Run Fast Greedy"),
+        actionButton("btn_label", "Label Propagation"),
+        actionButton("btn_infomap", "Run Infomap")
+    ),
+    hr(),
+    downloadButton("download_table", "Download Results Table"),
+    verbatimTextOutput("log")
   ),
   
   mainPanel(
     tabsetPanel(
-      tabPanel("2D Graph", plotOutput("graphPlot")),
-      tabPanel("3D Graph", uiOutput("graphPlot3D")),
-      tabPanel("Table", tableOutput("clusteredTable"))
+      tabPanel("2D Graph", plotOutput("graphPlot", height = "600px")),
+      tabPanel("3D Graph", scatterplotThreeOutput("graphPlot3D", height = "600px")),
+      tabPanel("Hubs", 
+               helpText("Nodes with high degree (hubs) are essential for network stability."),
+               tableOutput("hubTable")),
+      tabPanel("Method Comparison", 
+               helpText("Comparison of cluster membership across all executed methods."),
+               tableOutput("comparisonTable")),
+      tabPanel("Stability QA (ARI)", 
+               helpText("ARI (Adjusted Rand Index) correlation matrix. Values over 0.7 indicate high stability."),
+               plotOutput("ariPlot"))
     )
   )
 )
@@ -64,142 +71,179 @@ server <- function(input, output, session) {
   
   log_msgs <- reactiveVal(character())
   clustering_res <- reactiveVal(NULL)
-  all_results <- reactiveValues()
+  all_results <- reactiveValues() 
   
   data_raw <- reactive({
     infile <- input$file
     req(infile)
     ext <- tools::file_ext(infile$name)
-    if (ext == "csv") return(read.csv(infile$datapath, row.names = 1))
-    if (ext == "rds") return(readRDS(infile$datapath))
+    df <- NULL
+    if (ext == "csv") df <- read.csv(infile$datapath, row.names = 1)
+    if (ext == "rds") df <- readRDS(infile$datapath)
     if (ext == "RData") {
       tmp_env <- new.env()
       load(infile$datapath, envir = tmp_env)
-      if(exists("work_mat2", envir = tmp_env)) return(get("work_mat2", envir = tmp_env))
-      objs <- mget(ls(tmp_env), envir = tmp_env)
-      for (o in objs) if (is.data.frame(o) || is.matrix(o)) return(as.data.frame(o))
-    }
-    stop("File format not supported")
-  })
-  
-  process_biological_graph <- function(A) {
-    col_names <- colnames(A)
-    map_gprofiler <- gconvert(query = col_names, organism = "hsapiens", target = "ENTREZGENE_ACC", filter_na = TRUE)
-    colnames(map_gprofiler)[colnames(map_gprofiler) == "input"] <- "map_gprofiler.input"
-    colnames(map_gprofiler)[colnames(map_gprofiler) == "target"] <- "map_gprofiler.target"
-    
-    mapped_cols <- attach.entregene_gen(data.frame(Original = col_names), map_gprofiler, "Original", "map_gprofiler.input", "map_gprofiler.target")
-    genelist <- unique(mapped_cols$map_gprofiler.target)
-    gostres <- gost(query = genelist, organism = "hsapiens")
-    
-    req(gostres$result)
-    func_list <- gostres$result[, c("term_name", "intersection")]
-    protein_funcs <- list()
-    for (i in 1:nrow(func_list)) {
-      genes <- unlist(strsplit(func_list$intersection[i], ","))
-      for (g in genes) { protein_funcs[[g]] <- unique(c(protein_funcs[[g]], func_list$term_name[i])) }
-    }
-    
-    prots <- names(protein_funcs)
-    n <- length(prots)
-    sim_mat <- matrix(0, n, n, dimnames = list(prots, prots))
-    for (i in 1:n) {
-      for (j in i:n) {
-        common <- length(intersect(protein_funcs[[prots[i]]], protein_funcs[[prots[j]]]))
-        sim_mat[i,j] <- sim_mat[j,i] <- common
+      if(exists("work_mat2", envir = tmp_env)) df <- get("work_mat2", envir = tmp_env)
+      else {
+        objs <- mget(ls(tmp_env), envir = tmp_env)
+        for (o in objs) if (is.data.frame(o) || is.matrix(o)) df <- as.data.frame(o)
       }
     }
-    return(sim_mat)
+    return(as.matrix(df))
+  })
+  
+  methods_map <- list(btn_kmeans="kmeans", btn_louvain="louvain", btn_walktrap="walktrap", 
+                      btn_fastgreedy="fastgreedy", btn_label="label", btn_infomap="infomap")
+  
+  process_bio <- function(A) {
+    col_names <- colnames(A)
+    map_gprofiler <- gconvert(query = col_names, organism = "hsapiens", target = "ENTREZGENE_ACC", filter_na = TRUE)
+    return(A) 
   }
   
-  methods_map <- list(btn_kmeans="kmeans", btn_fastgreedy="fastgreedy", btn_louvain="louvain", 
-                      btn_walktrap="walktrap", btn_label="label", btn_infomap="infomap")
-  
-  observe({
-    lapply(names(methods_map), function(btn_id) {
-      observeEvent(input[[btn_id]], {
-        req(data_raw())
-        show_modal_spinner(text = "Calculating (Parallel)...")
+  lapply(names(methods_map), function(btn_id) {
+    observeEvent(input[[btn_id]], {
+      req(data_raw())
+      show_modal_spinner(text = paste("Parallel computing:", methods_map[[btn_id]], "..."))
+      
+      method_name <- methods_map[[btn_id]]
+      curr_mat <- data_raw()
+      input_noise <- input$noise_level
+      input_filter <- input$filter_isolated
+      type <- input$graph_type
+      k_val <- input$k
+      
+      future({
+        if (input_noise > 0) {
+          noise <- matrix(runif(length(curr_mat), -input_noise, input_noise), nrow = nrow(curr_mat))
+          curr_mat <- curr_mat + noise
+          curr_mat[curr_mat < 0] <- 0
+        }
         
-        type <- input$graph_type
-        method_name <- methods_map[[btn_id]]
-        k_val <- input$k
-        df <- data_raw()
+        g <- graph_from_adjacency_matrix(curr_mat, 
+                                         mode = ifelse(type == "directed", "directed", "undirected"), 
+                                         weighted = TRUE, diag = FALSE)
         
-        future({
-          if (type == "directed") {
-            final_mat <- process_biological_graph(df)
-            g <- graph_from_adjacency_matrix(as.matrix(final_mat), mode = "directed", weighted = TRUE)
-          } else {
-            g <- graph_from_adjacency_matrix(as.matrix(df), mode = "undirected", weighted = TRUE)
-          }
-          
-          layout <- layout_with_fr(g)
-          if (method_name == "kmeans") {
-            cl <- kmeans(layout, centers = k_val)$cluster
-          } else {
-            comm <- switch(method_name,
-                           fastgreedy = cluster_fast_greedy(g),
-                           louvain = cluster_louvain(g),
-                           walktrap = cluster_walktrap(g),
-                           label = cluster_label_prop(g),
-                           infomap = cluster_infomap(g))
-            cl <- as.numeric(membership(comm))
-          }
-          list(g = g, layout = layout, cluster = cl, method = method_name, node_names = V(g)$name)
-        }, seed = TRUE) %...>% (function(res) {
-          remove_modal_spinner()
-          clustering_res(res)
-          all_results[[res$method]] <- res$cluster
-          log_msgs(c(log_msgs(), paste(Sys.time(), "-", res$method, "done")))
-        }) %...!% (function(e) {
-          remove_modal_spinner()
-          showNotification(paste("Error:", e$message), type = "error")
-        })
+        g <- delete.edges(g, which(E(g)$weight <= 0))
+        
+        if (input_filter) {
+          comps <- components(g)
+          keep_nodes <- which(comps$membership %in% which(comps$csize >= 3))
+          g <- subgraph(g, keep_nodes)
+        }
+        
+        if (vcount(g) == 0) stop("The network is empty after filtering!")
+        
+        lay2d <- layout_with_fr(g)
+        lay3d <- layout_with_fr(g, dim = 3)
+        
+        if (method_name == "kmeans") {
+          cl <- as.integer(kmeans(lay2d, centers = k_val)$cluster)
+        } else {
+          comm <- switch(method_name,
+                         louvain = cluster_louvain(g),
+                         walktrap = cluster_walktrap(g),
+                         fastgreedy = cluster_fast_greedy(g),
+                         label = cluster_label_prop(g),
+                         infomap = cluster_infomap(g))
+          cl <- as.integer(membership(comm))
+        }
+        
+        hub_df <- data.frame(
+          Node = V(g)$name,
+          Degree = degree(g),
+          Betweenness = round(betweenness(g), 2)
+        ) %>% arrange(desc(Degree))
+        
+        list(g = g, layout = lay2d, layout3d = lay3d, cluster = cl, 
+             method = method_name, node_names = V(g)$name, hubs = hub_df)
+        
+      }, seed = TRUE) %...>% (function(res) {
+        remove_modal_spinner()
+        clustering_res(res)
+        
+        all_results[[res$method]] <- data.frame(Node = res$node_names, Cluster = res$cluster)
+        
+        log_msgs(c(log_msgs(), paste(Sys.time(), "-", res$method, "finished (Nodes:", vcount(res$g), ")")))
+      }) %...!% (function(e) {
+        remove_modal_spinner()
+        showNotification(paste("Error:", e$message), type = "error")
       })
     })
   })
-  
-  output$clusteredTable <- renderTable({
-    res <- clustering_res()
-    req(res)
-    data.frame(
-      Node_Name = res$node_names,
-      Cluster = res$cluster
-    )
-  })
-  
-   output$download_table <- downloadHandler(
-    filename = function() {
-      paste("clustering_results_", Sys.Date(), ".csv", sep = "")
-    },
-    content = function(file) {
-      res <- clustering_res()
-      req(res)
-      df <- data.frame(Node_Name = res$node_names, Cluster = res$cluster)
-      write.csv(df, file, row.names = FALSE)
-    }
-  )
   
   output$graphPlot <- renderPlot({
     res <- clustering_res()
     req(res)
     plot(res$g, layout = res$layout, vertex.color = res$cluster, 
          vertex.label = V(res$g)$name, vertex.size = 15,
-         edge.arrow.size = if(is_directed(res$g)) 0.4 else 0,
-         main = paste("Method:", res$method))
+         vertex.label.cex = 0.8, main = paste("Method:", res$method))
   })
   
-  output$graphPlot3D <- renderUI({
+  output$graphPlot3D <- renderScatterplotThree({
     res <- clustering_res()
     req(res)
-    g3d <- graphjs(res$g, layout = layout_with_fr(res$g, dim=3), 
-                   vertex.color = brewer.pal(8, "Set2")[as.numeric(res$cluster) %% 8 + 1],
-                   vertex.size = 0.5)
-    htmltools::tagList(g3d)
+    palette <- brewer.pal(8, "Set2")
+    node_colors <- palette[as.numeric(res$cluster) %% 8 + 1]
+    
+    graphjs(res$g, 
+            layout = res$layout3d, 
+            vertex.color = node_colors, 
+            vertex.size = 0.5, 
+            main = paste("3D Projection -", res$method))
+  })
+  
+  output$hubTable <- renderTable({
+    res <- clustering_res()
+    req(res)
+    head(res$hubs, 15)
+  }, digits = 2)
+  
+  output$comparisonTable <- renderTable({
+    methods_active <- names(reactiveValuesToList(all_results))
+    req(length(methods_active) > 0)
+    
+    df_list <- lapply(methods_active, function(m) {
+      d <- all_results[[m]]
+      colnames(d)[2] <- m
+      d
+    })
+    
+    comp_df <- Reduce(function(x, y) merge(x, y, by = "Node", all = TRUE), df_list)
+    return(comp_df)
+  }, digits = 0)
+  
+  output$ariPlot <- renderPlot({
+    methods <- names(reactiveValuesToList(all_results))
+    req(length(methods) >= 2)
+    
+    n <- length(methods)
+    ari_mat <- matrix(1, n, n, dimnames = list(methods, methods))
+    
+    for(i in 1:(n-1)) {
+      for(j in (i+1):n) {
+        m1 <- all_results[[methods[i]]]
+        m2 <- all_results[[methods[j]]]
+        merged <- merge(m1, m2, by = "Node")
+        if(nrow(merged) > 1) {
+          ari_mat[i,j] <- ari_mat[j,i] <- adjustedRandIndex(merged$Cluster.x, merged$Cluster.y)
+        }
+      }
+    }
+    corrplot(ari_mat, method = "pie", type = "upper", addCoef.col = "black", 
+             title = "Cluster Stability QA (ARI Index)", mar = c(0,0,2,0))
   })
   
   output$log <- renderText({ paste(log_msgs(), collapse = "\n") })
+  
+  output$download_table <- downloadHandler(
+    filename = function() { paste("results_", Sys.Date(), ".csv", sep="") },
+    content = function(file) {
+      res <- clustering_res()
+      req(res)
+      write.csv(res$hubs, file, row.names = FALSE)
+    }
+  )
 }
 
 shinyApp(ui, server)
